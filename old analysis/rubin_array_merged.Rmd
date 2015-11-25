@@ -1,0 +1,804 @@
+---
+output:
+  knitrBootstrap::bootstrap_document:
+    title: "Analysis of Affymetrix GeneChip® Mouse Gene ST Arrays"
+    theme: readable
+    highlight: zenburn
+    theme.chooser: FALSE
+    highlight.chooser: FALSE
+bibliography: references.bib
+---
+
+
+# Analysis of Affymetrix GeneChip® Mouse Gene ST Arrays
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+library(knitcitations)
+cleanbib()
+options("citation_format" = "pandoc")
+
+clientname="Lida Katsimpardi" 
+clientemail=""
+labPI="Lee Rubin"
+lablocation=""
+analystname="Andreas Sjodin"
+analystemail="sjodin@hsph.harvard.edu"
+
+
+#library(knitr)
+#opts_chunk$set(warning=FALSE, error=FALSE, message=FALSE, echo=FALSE,cache=TRUE, tidy.opts=list(keep.blank.line=FALSE, width.cutoff=150), dev="png")
+#options(width=150)
+```
+
+
+```{r knitrsetup, echo=FALSE}
+knitr::opts_chunk$set(tidy=TRUE, highlight=TRUE, dev="png", bootstrap.show.code=FALSE, bootstrap.show.output=FALSE, cache=TRUE, highlight=TRUE, autodep=TRUE, warning=FALSE, error=FALSE, message=FALSE, prompt=TRUE, comment='', fig.cap='', tidy.opts=list(keep.blank.line=FALSE, width.cutoff=150))
+
+options(width=150)
+``` 
+
+
+---
+
+Array analysis for `r clientname`, `r labPI` group.  
+
+Contact `r analystname` (`r analystemail`) for additional details.
+
+The most recent update of this html document occurred: `r date()`
+
+The sections below provide code to reproduce the included results and plots. 
+
+---
+
+
+# Methods Summary  
+
+All Affymtrix GeneChip® Mouse Gene 2.1 ST arrays were processed using the 'oligo' BioConductor package `r citep("10.1093/bioinformatics/btq431")`, quality-controlled with arrayQualityMetrics `r citep("10.1093/bioinformatics/btn647")` and normalized with RMA `r citep("10.1093/biostatistics/4.2.249")`. Differentially expressed genes were identified using limma `r citep("http://link.springer.com/chapter/10.1007%2F0-387-29362-0_23")`.
+
+---
+
+# Setup
+
+## Variables
+Working directories, files and other variables necessary to the analysis.
+
+```{r variables}
+## Setup Data and Results directory variables
+if(file.exists("/groups/bcbio/rubin_array")){
+  baseDir="/groups/bcbio/rubin_array"
+    } else if (file.exists("/Users/andreassjodin/hbc-projects/orchestra/rubin_array")){
+    baseDir="/Users/andreassjodin/hbc-projects/orchestra/rubin_array"
+    } else if (file.exists("/Users/andreassjodin/Desktop/rubin_array")){
+    baseDir="/Users/andreassjodin/Desktop/rubin_array"
+    }
+dataDir <- file.path(baseDir, "data")
+metaDir <- file.path(baseDir, "meta")
+resultsDir <- file.path(baseDir, "analysis/results")
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7") # colorblind friendly palette
+covarsfilename="covars_merged.csv" # comma delimited file describing samples
+lowintensity.percentile=0.1
+mad.quantile.cutoff=0.1
+pvalue.cutoff=0.1
+highlight.color="green"
+lfc.cutoff=1
+Sys.setenv(R_THREADS=2)
+```
+
+## Libraries
+
+[Bioconductor](http://www.bioconductor.org) and [R](http://cran.r-project.org/) libraries used to process and visualize the data.
+
+```{r libraries_variables, echo=TRUE}
+library(knitr) # for simple tables
+library(oligo) # array utilities
+library(arrayQualityMetrics) # array quality control reports
+library(limma) # array statistical analyses
+library(sigaR)
+library(inSilicoMerging)
+library(devtools) # install libraries from github
+install_git("git://github.com/hbc/CHBUtils.git") # misc personal utilities
+library(CHBUtils) # some homegrown functions
+library(reshape2) # data format utility
+library(ggplot2) # pretty graphs
+library(ggdendro) # for pretty dendrograms
+library(RColorBrewer) # more colors
+library(gridExtra) # for arranging multiple plots
+library(venneuler) # for venn diagrams
+library(pheatmap) # pretty heatmaps
+library(plyr) # data format utility
+library(Ringo)
+library(corrgram)
+library(pvca)
+library(dplyr) # data format utility 
+library(pd.mogene.2.1.st) # array layout annotation
+library(mogene21sttranscriptcluster.db) #Annotation package for HTA 2.0
+library(sva) # Surrogate Variable Analysis (includes ComBat)
+library(gProfileR) # Interface to g:Profiler
+library(treemap)
+#library(a4Base)
+```
+
+
+
+## Functions
+
+```{r functions}
+# for plotting amount of variation explained by principal components
+PCAplot.sd.eset <- function(eset=NULL,  title=NULL){
+  eset.core <- exprs(eset)
+  myPca.core <- prcomp(t(eset.core))
+  # SD of components
+  sdevdf <- data.frame(cbind(as.numeric(myPca.core$sdev),c(1:length(myPca.core$sdev))))
+  sdevdf$prop <-  sdevdf$X1/sum(sdevdf$X1)
+  sdevdf$cum <- cumsum(sdevdf$prop)
+  ggplot(sdevdf, aes(x=X2, y=prop)) + 
+    geom_point(size=4, color="red") + 
+    scale_x_continuous('Component') + 
+    scale_y_continuous('Standard Deviation') +
+    ggtitle(title) +
+    geom_line(data=sdevdf, aes(x=X2, y=cum))
+}
+
+# used for formatting labels on ggplots
+fmt <- function(){ 
+  function(x) format(x,nsmall = 1,scientific = FALSE)
+}
+
+
+
+plot_dendro <- function(x, title="", labels.colname=NULL, colors.colname=NULL) {
+  require(ggdendro)
+  meta.x <- pData(x)
+  # force the metadata into character format so you don't end up with gradient/continuous color schemes for numerical variables in the final plot  
+  meta.x <- as.matrix(meta.x) 
+  ## do the actual statistics and put into dendrogram 
+  myDist <- dist(t(exprs(x)))
+  myTree <-hclust(myDist)
+  dhc <- as.dendrogram(myTree)
+  ddata <- dendro_data(dhc, type="rectangle")
+  # the labels of the dendrogram are pulled from the Expression set exprs column names, it's nice to rename them to something more intelligible if you haven't already, as well as match them up to the metadata for label coloring
+  ## check to see if the column names of the expression set match anything in the metadata, or match the rownames
+  if (identical(colnames(exprs(x)), row.names(meta.x))) {
+    meta.x <- row2colnames(meta.x, "rownames")
+    matchcol <- "rownames"
+  } else if (any(apply(meta.x, 2, function(column) identical(as.character(unlist(column)), colnames(exprs(x)))))) {
+    matchcol <- names(which(apply(meta.x, 2, function(column) identical(as.character(unlist(column)), colnames(exprs(x))))))
+  } else {
+    print("ExpressionSet sampleNames and pData row.names or pData column must match")
+    stop()
+  }
+  ## merge the metadata with the dendrogram labels using the commmon column/rownames you just identified above
+  ddata$labels <- merge(ddata$labels, meta.x, by.x="label", by.y=matchcol)
+  # plot it like you mean it
+  ggplot(segment(ddata)) +
+    geom_segment(aes(x=x, y=y, xend=xend, yend=yend)) +
+    theme_dendro() +
+    geom_text(data=label(ddata), aes_string(x='x', y='y', label=labels.colname, color=colors.colname, hjust=-0.1), size=4)+
+    scale_color_brewer(type = "seq", palette = "Set1")+
+    coord_flip() + scale_y_reverse(expand=c(0.2, 50)) +
+    theme(axis.text.x=element_blank(),
+          axis.text.y=element_blank(),
+          axis.title.x=element_blank(),
+          axis.title.y=element_blank()) +
+    ggtitle(title)
+}
+
+runRevigo <- function(GOs =NULL, pvals=NULL, cutoff = 0.5, organism = "whole UniProt", 
+                      isPValue="yes", whatIsBetter="higher", measure="SIMREL"){
+
+organism.list <- list(
+  "whole UniProt"=0, 
+  "Homo sapiens"=9606,
+  "Mus musculus"=10090,
+  "Rattus norvegicus"=10116,
+  "Bos taurus"=9913,
+  "Gallus gallus"=9031,
+  "Danio rerio"=7955,
+  "Takifugu rubripes"=31033,
+  "Xenopus laevis"=8355,
+  "Drosophila melanogaster"=7227,
+  "Caenorhabditis elegans"=6239,
+  "Arabidopsis thaliana"=3702,
+  "Oryza sativa"=39947,
+  "Zea mays"=4577,
+  "Saccharomyces cerevisiae"=4932,
+  "Schizosaccharomyces pombe"=4896,
+  "Dictyostelium discoideum"=44689,
+  "Plasmodium falciparum"=5833,
+  "Chlamydomonas reinhardtii"=3055,
+  "Escherichia coli"=83333,
+  "Bacillus subtilis"=1423,
+  "Pseudomonas aeruginosa"=287,
+  "Mycobacterium tuberculosis"=1773,
+  "Mycoplasma genitalium"=2097,
+  "Synechocystis sp."=1148
+)
+organism.db <- as.character(organism.list[organism])
+
+mycommand  <- paste('revigo.pl -goterms', paste(GOs,collapse=","), 
+                    '-gopvals', paste(pvals,collapse=","), 
+                    '-cutoff', cutoff,  
+                    '-organism', organism.db, 
+                    '-ispvalue', isPValue, 
+                    '-whatisbetter', whatIsBetter, 
+                    '-measure', measure, sep=" ")
+
+mytempfile <- tempfile()
+system2(command='/Users/andreassjodin/perl5/perlbrew/perls/perl-5.16.0/bin/perl', args=mycommand, stdout=mytempfile)
+source(mytempfile)
+
+}
+
+
+df.toptable <- function(top_table){
+  out_table = data.frame(id=rownames(top_table), expr=top_table$AveExpr,
+    logFC=top_table$logFC, pval=top_table$P.Value,
+    padj=top_table$adj.P.Val)
+  return (out_table)
+}
+
+```
+
+---
+
+# Import Data and Metadata
+
+## Data
+- load in phenotypes and array names from metadata file (covars.csv) in "metadata" directory
+  - this file contains the names and descriptions of CEL files contained in the data directory 
+- use array names to load in arrays 
+
+```{r dataload, results='hide'}
+covars <- read.table(file.path(metaDir, covarsfilename),header=TRUE, sep=",", row.names=1) # simple tab delimited file with CEL file in first column (no heading for this column) and sample metadata (i.e. sampleID, treatment group, batch etc.) in subsequent columns
+covars$sampleID<-as.character(covars$sampleID)
+#covars<-covars[covars$batch==1,]
+
+celFiles <- file.path(dataDir, row.names(covars))
+affyRaw <- read.celfiles(celFiles)
+pData(affyRaw) <- covars 
+sampleNames(affyRaw) <- pData(affyRaw)$sampleID
+validObject(affyRaw)
+rm(covars)
+```
+
+## Sample metadata
+
+```{r covars, results='asis', echo=FALSE}
+# Sample information table
+kable(pData(affyRaw), row.names=F)
+```
+
+---
+
+# PreProcessing 
+
+## Raw Data 
+
+### Quality Control
+
+- using arrayQualityMetrics library `r citep("Kauffmann_2008")`
+
+```{r rawQC, eval=FALSE}
+arrayQualityMetrics(expressionset=affyRaw, outdir=file.path(resultsDir, 'reportmerged_raw'), force=TRUE, do.logtransform=TRUE, intgroup=c("sampleID", "treatment", "batch"))
+```
+
+[Raw Data QC Report](results/report_raw/index.html)
+
+The analysis indicates no potential outliers. Clusters in two major clusters corresponding in the two batches. 
+
+
+## RMA Normalized Data
+
+- background correct and normalize data with RMA `r citep("10.1093/bioinformatics/19.2.185")`
+
+- summarize probesets on the gene ('core') level
+
+```{r normalize, results='hide'}
+affyNorm.core <- rma(affyRaw, target="core", background=TRUE, normalize=TRUE)
+
+```
+
+
+### Quality Control
+- using arrayQualityMetrics library
+
+```{r normQC, eval=FALSE}
+arrayQualityMetrics(expressionset=affyNorm.core, outdir=file.path(resultsDir, paste("reportmerged_rma.core", sep=".")), force=TRUE, do.logtransform=FALSE, intgroup=c("sampleID", "treatment", "batch"))
+
+```
+
+
+[Normalized Data QC Report](results/reportmerged_rma.core/index.html)
+
+
+The normalized data show looks good. One sample is marked as a potential outlier but it will be used in the analysis.
+
+### Correlations
+
+```{r correlation, fig.cap="Correlations between arrays - all combinations"}
+expression<-exprs(affyNorm.core)
+R = cor(expression)
+corrgram(R, order = NULL, lower.panel = panel.conf, upper.panel = NULL, text.panel = panel.txt, main = "Correlations between arrays")
+```
+
+
+The correlations looks good.
+
+## Annotate
+
+So far we have only been working with the probesets, without reference to the genes they assay. Here we load in metadata about the probesets on the array (feature data), the gene symbols in particular.
+
+```{r features, results='hide'}
+
+featureData(affyNorm.core) <- getNetAffx(affyNorm.core, "transcript") # this will load the Affymetrix annotation, including the probeID, into the fData
+# get gene symbols and entrezIDs for all probesets
+fData(affyNorm.core)$symbol <- as.character(unlist(mget(featureNames(affyNorm.core), mogene21sttranscriptclusterSYMBOL, ifnotfound=NA))) # curated annotations from Bioconductor 
+fData(affyNorm.core)$entrezID <- as.character(unlist(mget(featureNames(affyNorm.core), mogene21sttranscriptclusterENTREZID, ifnotfound=NA))) # curated annotations from Bioconductor 
+numprobes <- nrow(fData(affyNorm.core))
+fData(affyNorm.core)$annotation <- unlist(lapply(strsplit(fData(affyNorm.core)[,"geneassignment"], " // "), function(x)x [3]))
+
+```
+
+## Filter Probesets
+Reducing the number of genes assayed reduces  the multiple test correction and may allow us to identify more differentially expressed genes.
+
+Starting  with `r numprobes` probes remaining we can filter:
+
+### By Annotation
+- remove the control probes. We are keeping all other probes by request from the client.
+
+```{r filter1}
+affyNorm.all <- affyNorm.core
+#affyNorm.core <- affyNorm.core[which(!is.na(fData(affyNorm.core)$symbol) & fData(affyNorm.core)$category=="main"),]
+affyNorm.core <- affyNorm.core[ fData(affyNorm.core)$category=="main",]
+numprobes <- nrow(fData(affyNorm.core))
+
+```
+
+`r numprobes` probes remaining
+
+
+### By Cross Hybridization
+- some probes are annotated as potentially hybridizing to multiple targets
+
+```{r filter2}
+affyNorm.core <- affyNorm.core[which(fData(affyNorm.core)$crosshybtype=="1"),]
+numprobes <- nrow(fData(affyNorm.core))
+
+```
+
+`r numprobes` probes remaining
+
+
+### By Low Expression Level
+- remove probes with low expression levels (bottom `r lowintensity.percentile*100`% of all expression levels) in all samples
+
+```{r filter3, cache=TRUE}
+eset.core <- exprs(affyNorm.core)
+affyNorm.core <- affyNorm.core[!(apply(eset.core, 1, function(x) all(x<quantile(exprs(affyNorm.core), lowintensity.percentile)))),]
+
+numprobes <- nrow(fData(affyNorm.core))
+
+```
+
+`r numprobes` probes remaining
+
+
+### By Low Variability
+- remove probes with lower variation among all samples (without regard for group status) (dropped the bottom `r mad.quantile.cutoff*100`%) 
+
+```{r filter4}
+eset.core <- exprs(affyNorm.core)
+rowmads <- apply(eset.core, 1, mad)
+mad.cutoff <- as.numeric(quantile(rowmads, mad.quantile.cutoff))
+affyNorm.core <- affyNorm.core[rowmads>mad.cutoff,]
+
+numprobes <- nrow(fData(affyNorm.core))
+```
+
+`r numprobes` probes remaining
+
+
+### Unsupervised Clustering of RMA Normalized Data
+
+#### Hierarchical Clustering
+The goal of these analyses are to naively evaluate the variability within the raw data and determine whether this variability can predict the different sample groups
+
+The first method produces a dendrogram by performing a hierarchical cluster analysis using a set of dissimilarities for the n objects being clustered
+
+```{r cluster1}
+plot_dendro(affyNorm.all, title="", labels.colname="Treatment", colors.colname="batch")
+```
+
+The samples are divided into two main clusters based on the two experiments and duplicates are grouped together..
+
+
+#### Principal Component Analysis (PCA)
+
+This second approach is a dimension reduction and visualization technique that is used to project the multivariate (i.e.multiple genes) data vector of each array into a lower-dimensional plot, such that the spatial arrangement of the points in the plot reflects the overall data (dis)similarity between the arrays. The data is typically reduced to a small number of dimensions (or components) which explain most of the sample variability. This [Youtube slideshow](https://www.youtube.com/watch?v=BfTMmoDFXyE) gives a pretty good basic explanation of what PCA is doing.
+
+```{r PCAsd1}
+PCAplot.sd.eset(affyNorm.core, title="")
+```
+
+Here, each point depicts the amount of variation explained by each component and the line shows the cumulative amount. For this data set, the first dimension explains a major part of the variation. T
+
+As plots with more than 2 dimensions are difficult to visualize, we typically  split up the dimensions/components and plot them pairwise against each other; the plots here show scatterplots of the arrays along all dual combinations of the first five principal components. In the first plot, each sample group is represented by a separate color and in the second plot each sample is represented by a different color. 
+
+You can use these plots to explore if the arrays cluster, find outliers, and determine whether this is according to an intended experimental factor or according to unintended causes such as batch effects. 
+
+```{r PC1vPC2}
+
+pca_obj <- prcomp(t(exprs(affyQNorm.all)))
+pca_matrix <- pca_obj$x
+
+# Create data frame for input to ggplot
+df <- cbind(pData(affyQNorm.all), pca_matrix[,c('PC1', 'PC2')])
+
+# Plot PC1 against PC2
+ggplot(df, aes(PC1, PC2, color = batch)) + 
+  geom_point(aes(size=5))
+
+# Plot with sample names used as data points
+ggplot(df, aes(PC1, PC2, color = batch)) + 
+  geom_text(aes(PC1, PC2, label = Treatment), size = 4, hjust=1, vjust=1) +
+  geom_point() +
+  scale_x_continuous(expand = c(0.3,  0.3))
+```
+
+```{r pca1, fig.cap="Primary Component Analysis of samples - all combinations of the 3 first primary components"}
+PCAplot.eset(affyQNorm.all, categories="Treatment", title="", colorpalette=cbPalette, numcomponents=2, alpha=0.75)
+```
+
+The duplicated samples are clustering nicely in the two first dimensions.
+
+
+---
+
+## Statistical Analyses
+
+### Limma
+
+A linear model for microarray data analysis (Limma `r citep("http://www.bioconductor.org/packages/release/bioc/html/limma.html")`) was performed on the samples to identify differentially expressed genes for comparisons of the sample groups. Limma fits a linear model to the expression data for all samples for each gene and is designed to handle complex experiments involving comparisons between many RNA targets simultaneously.
+
+To perform limma, we construct two matrices. The design matrix provides a representation of the different sample groups which have been analysed. The contrast matrix allows the coefficients defined by the design matrix to be combined into contrasts of interest.
+
+We will do three analysis parallel due to the batch issue. Batch 1, batch 2 and the combined batch normalised data. 
+
+#### Design 
+- make a matrix with arrays as rows, sample groups as columns
+- a one or a zero indicate respectively, that a sample either belongs or does not belong to the sample group 
+
+
+```{r design.treat, results="asis"}
+
+# Treatment
+#design.treat <- model.matrix(~  batch * treatment,  data=pData(affyNorm.core))
+
+design.treat <- model.matrix(~ 0 + treatment,  data=pData(affyNorm.core))
+colnames(design.treat) <- sub("treatment", "", colnames(design.treat))
+kable(data.frame(sample= rownames(design.treat), design.treat), row.names=F)
+
+
+
+```
+
+#### Contrasts
+- to perform specified pairwise comparisons
+- in this table, columns are contrasts/comparisons and rows are sample groups
+-  a zero denotes that the sample group is not involved in the contrast, a 1 denotes that it has higher expression in the contrast and a -1 denotes lower expression in the contrast
+
+In this case we are initially only interested to compare GDF11 vs saline treatment.
+
+
+```{r contrastmatrix.treat, results='asis'}
+contrast.matrix.treat <- makeContrasts(
+  GDF11vsSaline=GDF11-Saline,
+  OldvsYoung=Old-Young,                                     
+  levels=colnames(design.treat))
+
+dimnames(contrast.matrix.treat)$Contrasts <- gsub(" " , "", dimnames(contrast.matrix.treat)$Contrasts)
+
+kable(data.frame(group= rownames(contrast.matrix.treat), contrast.matrix.treat), row.names=F)
+
+```
+
+
+These matrices are used to fit a linear model to the data. The linear model is applied and pairwise comparisons are performed to identify differentially expressed genes.
+
+- first fit the linear model based on the design matrix for each gene based on the given series of arrays
+- using the contrast matrix, compute estimated coefficients and standard errors for contrasts
+- compute moderated t-statistics and log-odds of differential expression by empirical Bayes shrinkage of the standard errors towards a common value
+
+####Linear model
+
+- for each gene based on the given series of arrays
+
+```{r linearmodel}
+eset.core <- exprs(affyNorm.core)
+fit.core.treat <- lmFit(eset.core, design.treat) 
+
+```
+
+**Compute estimated coefficients and standard errors for contrasts**
+
+```{r contrastfit}
+fit2.core.treat <- contrasts.fit(fit.core.treat, contrast.matrix.treat) 
+
+```
+
+####Bayes shrinkage
+
+**Compute moderated t-statistics and log-odds of differential expression**
+
+- by empirical Bayes shrinkage of the standard errors towards a common value
+
+```{r bayes}
+fit2.core.treat <- eBayes(fit2.core.treat) 
+
+```
+
+
+--- 
+
+# Results
+
+## Statistics
+
+- as calculated by Limma
+
+```{r allstats, results='hide'}
+#Treatment
+all.results.treat <- lapply(seq(1:length(dimnames(contrast.matrix.treat)$Contrasts)), function(num) {
+  contrast <- dimnames(contrast.matrix.treat)$Contrasts[num]
+  stats <- topTable(fit2.core.treat, coef=num, sort.by="B",adjust.method="BH",number=nrow(fData(affyNorm.core)), genelist=fData(affyNorm.core)[,c("probesetid", "symbol", "entrezID", "annotation")])
+  stats$Passes.FDR.threshold  <-  as.factor(stats$adj.P.Val<pvalue.cutoff)
+  eset <- exprs(affyNorm.core)
+  eset  <-  eset[match(stats$probesetid, row.names(eset)),]
+  stats.eset <- cbind(stats, eset)
+  return(list(contrast=contrast, stats.eset=stats.eset))
+  })
+
+# output all results to files
+lapply(seq(1:length(dimnames(contrast.matrix.treat)$Contrasts)), function(num) {
+  contrast <- dimnames(contrast.matrix.treat)$Contrasts[num]
+  out.stats=as.data.frame(all.results.treat[[num]]$stats.eset)
+  write.table(out.stats, file=file.path(resultsDir, paste("all.genes.stats.exprs", contrast, "xls", sep=".")),  sep ="\t",, row.names=F, col.names=T)
+})
+
+```
+
+### Statistics and expression levels of all genes for these comparisons
+
+*Note that for all these files, I have not summarized values for genes assayed by multiple probes (i.e. by taking the median value), so you may see multiple instances of the same gene in the results*
+
+*All genes*
+
+`r x=1`
+* [GDF11 vs Saline - all genes](results/all.genes.stats.exprs.`r all.results.treat[[x]]$contrast`.xls)
+* [Old vs Young - all genes](results/all.genes.stats.exprs.`r all.results.treat[[x]]$contrast`.xls)
+
+
+**These summary tables contain the following information:**
+
+- logFC is the log2-fold change
+- the AveExpr is the average expression value accross all arrays
+- the moderated t-statistic (t) is the logFC to its standard error, the P.Value is the associated p-value
+- the adj.P.Value is the p-value adjusted for multiple testing (by FDR) 
+- the B-value (B) is the log-odds that a gene is differentially expressed (the-higher-the-better)
+- the last 8 columns contain the log-transformed normalized expression levels for these genes in each sample
+
+
+---
+
+## Identifying Genes 
+
+### Volcano plots
+Here we can visulize the relationship between the fold changes in expression observed for the different pulldowns. Our best candidate genes will not only have a statistically significant difference in gene expression between the two sample groups (as measured adjusted pvlaue) but also a large change (as measured by the log2 fold change). We are also only interested in genes that are enriched after pulldown, not those that are higher in the input samples.
+
+**Each of these plots contains 3 subplots:**
+
+1) Bottom left - the volcano plot, a scatter plot with the observed log2fold changes (extremes are better) plotted against the -log10 adjusted pvalues (higher is better). For these contrasts, we are looking for genes that are significantly differently expressed, genes that have at least an adjusted pvalue of `r pvalue.cutoff` and a log 2 fold change more than `r lfc.cutoff` are highlighted with a green box.   
+
+2) Upper left - a density plot (smoothed histogram) of the log2 fold changes observed for the contrast, the part of the distribution above `r lfc.cutoff` is highlighted under the curve in `r highlight.color`.  
+
+3) Lower right - a density plot (smoothed histogram) of the adjusted pvalued observed for the contrast, the part of the distribution above `r pvalue.cutoff` is highlighted under the curve in `r highlight.color`. Note that for this plot, this highlight also included genes enriched in the input samples.
+
+
+```{r ggplotexps1}
+volcano_density_plot(all.results.treat[[1]]$stats.eset[,c("logFC", "adj.P.Val")], title="GDF11 vs Saline", lfc.cutoff = lfc.cutoff, pval.cutoff = pvalue.cutoff, shade.colour=highlight.color )         
+volcano_density_plot(all.results.treat[[2]]$stats.eset[,c("logFC", "adj.P.Val")], title="Old vs Young", lfc.cutoff = lfc.cutoff, pval.cutoff = pvalue.cutoff, shade.colour=highlight.color )         
+
+```
+
+
+
+Using these pvalue and log2 fold change cutoffs we can identify which genes are showing enrichment in the treatment. The cutoffs I have picked here (pvalue<`r pvalue.cutoff` and log2foldchange>`r lfc.cutoff`) are within accepted range, but are arbitrary. 
+
+**If you want to change these cutoffs to be more or less stringent, you can filter the Excel files above by adj.P.Val and logFC in Excel.**
+
+For these cutoffs: 
+
+
+`r x=1`
+- the `r all.results.treat[[x]]$contrast` contrast, has `r nrow(subset(all.results.treat[[x]]$stats.eset, (logFC>lfc.cutoff | logFC< -lfc.cutoff) & adj.P.Val<pvalue.cutoff))` enriched probesets probing `r length(unique(subset(all.results.treat[[x]]$stats.eset, (logFC>lfc.cutoff | logFC< -lfc.cutoff) & adj.P.Val<pvalue.cutoff)$symbol))` genes.
+
+`r x=2`
+- the `r all.results.treat[[x]]$contrast` contrast, has `r nrow(subset(all.results.treat[[x]]$stats.eset, (logFC>lfc.cutoff | logFC< -lfc.cutoff) & adj.P.Val<pvalue.cutoff))` enriched probesets probing `r length(unique(subset(all.results.treat[[x]]$stats.eset, (logFC>lfc.cutoff | logFC< -lfc.cutoff) & adj.P.Val<pvalue.cutoff)$symbol))` genes.
+
+
+## Over-representated categories (GDF11 vs Saline)
+
+Running the significant DE genes through [g:profiler](http://biit.cs.ut.ee/gprofiler/) reveals significant enrichment of genes involved in multiple GO processes. In addition, g:profiler also look for over-presentation in KEGG, REACTOME, TRANSFAC, mirBase microRNAs, CORUM protein complexes and Human Phenotype Ontology categories. 
+
+```{r go_analysis , bootstrap.show.output=TRUE}
+gdf11.signgenes <- subset(all.results.treat[[1]]$stats.eset, (logFC>lfc.cutoff | logFC< -lfc.cutoff) & adj.P.Val<pvalue.cutoff)$symbol
+gdf11.signgenes <- gdf11.signgenes [!is.na(gdf11.signgenes)]
+go.gdf11 <- gprofiler(as.character(gdf11.signgenes), organism = "mmusculus")
+#Write all significant GO categories
+write.table(go.gdf11, file="results/go.gdf11.xls", quote=FALSE, row.names=FALSE, sep="\t")
+
+```
+
+**Output files for significant categories** 
+
+* ["Significant categories for GDF11"](results/go.gdf11.xls) 
+
+
+### Gene ontology 
+
+#### Biological process
+Significant GO BP categories
+
+
+```{r gobp_batch2  , bootstrap.show.output=TRUE}
+gobp.gdf11.tbl<-go.gdf11[grepl("BP", go.gdf11[,"domain"]), c("term.id", "term.name", "p.value")]
+arrange(gobp.gdf11.tbl, p.value)
+```
+
+
+Gene ontology enrichment analyses can yield an overwhelming number of enriched categories, many with redundant functionality. We can simplify this output by identifying the most representative subset of the terms, using metrics which measure the semantic similarity of the terms. [Revigo](http://revigo.irb.hr/) performs such analyses `r citep("10.1371/journal.pone.0021800")`, using an algortithm which forms
+
+>  groups of highly similar GO terms, where the choice of the groups’ representatives is guided by the p-values
+
+The algorithm takes into account the parent-child structure of the gene onotology database
+
+> If the p-values are quite close and one term is a child node of the other, REVIGO will tend to choose the parent term
+
+The algorithm also ytries to find more specific GO terms.
+
+> Very general GO terms, however, are always avoided as cluster representatives ... as they tend to be uninformative
+
+Revigo allows visualization of these representatives and their relations to the terms within their group  as a [treemap](http://en.wikipedia.org/wiki/Treemapping). Here the color depicts a grouping of related terms, the size of a block, it's pvalue from g:profiler and the large text the most representative gene ontology term for the related group.
+
+Summary by REVIGO using defult settings and setting organism to mouse.
+
+```{r revigo}
+
+runRevigo(GOs =go.gdf11[, "term.id"], pvals=go.gdf11[, "p.value"], cutoff = 0.4, organism = "Mus musculus")
+```
+
+#### Molecular function
+Significant GO MF categories
+
+```{r gomf_batch2  , bootstrap.show.output=TRUE}
+gomf.gdf11.tbl<-go.gdf11[grepl("MF", go.gdf11[,"domain"]), c("term.id", "term.name", "p.value")]
+arrange(gomf.gdf11.tbl, p.value)
+```
+
+###  KEGG
+Significant KEGG categories
+
+```{r kegg_batch2  , bootstrap.show.output=TRUE}
+kegg.gdf11.tbl<-go.gdf11[grepl("KEGG", go.gdf11[,"term.id"]), c("term.id", "term.name", "p.value")]
+arrange(kegg.gdf11.tbl, p.value)
+```
+
+###  Reactome
+Significant Reactome categories
+
+```{r reactome_batch2  , bootstrap.show.output=TRUE}
+reactome.gdf11.tbl<-go.gdf11[grepl("REAC", go.gdf11[,"term.id"]), c("term.id", "term.name", "p.value")]
+reactome.gdf11.tbl$term.name <- substring(reactome.gdf11.tbl$term.name, 1, 75)
+arrange(reactome.gdf11.tbl, p.value)
+```
+
+## Over-representated categories (Old vs young)
+
+Running the significant DE genes through [g:profiler](http://biit.cs.ut.ee/gprofiler/) reveals significant enrichment of genes involved in multiple GO processes. In addition, g:profiler also look for over-presentation in KEGG, REACTOME, TRANSFAC, mirBase microRNAs, CORUM protein complexes and Human Phenotype Ontology categories. 
+
+```{r go_analysis-age , bootstrap.show.output=TRUE}
+age.signgenes <- subset(all.results.treat[[2]]$stats.eset, (logFC>lfc.cutoff | logFC< -lfc.cutoff) & adj.P.Val<pvalue.cutoff)$symbol
+age.signgenes <- age.signgenes [!is.na(age.signgenes)]
+go.age <- gprofiler(as.character(age.signgenes), organism = "mmusculus")
+#Write all significant GO categories
+write.table(go.age, file="results/go.age.xls", quote=FALSE, row.names=FALSE, sep="\t")
+
+```
+
+**Output files for significant categories** 
+
+* ["Significant categories for age"](results/go.age.xls) 
+
+
+### Gene ontology 
+
+#### Biological process
+Significant GO BP categories
+
+
+```{r gobp-age  , bootstrap.show.output=TRUE}
+gobp.age.tbl<-go.age[grepl("BP", go.age[,"domain"]), c("term.id", "term.name", "p.value")]
+arrange(gobp.age.tbl, p.value)
+```
+
+
+Gene ontology enrichment analyses can yield an overwhelming number of enriched categories, many with redundant functionality. We can simplify this output by identifying the most representative subset of the terms, using metrics which measure the semantic similarity of the terms. [Revigo](http://revigo.irb.hr/) performs such analyses `r citep("10.1371/journal.pone.0021800")`, using an algortithm which forms
+
+>  groups of highly similar GO terms, where the choice of the groups’ representatives is guided by the p-values
+
+The algorithm takes into account the parent-child structure of the gene onotology database
+
+> If the p-values are quite close and one term is a child node of the other, REVIGO will tend to choose the parent term
+
+The algorithm also ytries to find more specific GO terms.
+
+> Very general GO terms, however, are always avoided as cluster representatives ... as they tend to be uninformative
+
+Revigo allows visualization of these representatives and their relations to the terms within their group  as a [treemap](http://en.wikipedia.org/wiki/Treemapping). Here the color depicts a grouping of related terms, the size of a block, it's pvalue from g:profiler and the large text the most representative gene ontology term for the related group.
+
+Summary by REVIGO using defult settings and setting organism to mouse.
+
+```{r revigo-age}
+
+runRevigo(GOs =go.age[, "term.id"], pvals=go.age[, "p.value"], cutoff = 0.4, organism = "Mus musculus")
+```
+
+#### Molecular function
+Significant GO MF categories
+
+```{r gomf-age  , bootstrap.show.output=TRUE}
+gomf.age.tbl<-go.age[grepl("MF", go.age[,"domain"]), c("term.id", "term.name", "p.value")]
+arrange(gomf.age.tbl, p.value)
+```
+
+###  KEGG
+Significant KEGG categories
+
+```{r kegg-age  , bootstrap.show.output=TRUE}
+kegg.age.tbl<-go.age[grepl("KEGG", go.age[,"term.id"]), c("term.id", "term.name", "p.value")]
+arrange(kegg.age.tbl, p.value)
+```
+
+###  Reactome
+Significant Reactome categories
+
+```{r reactome-age  , bootstrap.show.output=TRUE}
+reactome.age.tbl<-go.age[grepl("REAC", go.age[,"term.id"]), c("term.id", "term.name", "p.value")]
+reactome.age.tbl$term.name <- substring(reactome.age.tbl$term.name, 1, 75)
+arrange(reactome.age.tbl, p.value)
+```
+
+--- 
+  
+
+
+---
+
+
+# R Session Info
+
+(useful if replicating these results)
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+---
+
+# References
+
+```{r writebib}
+write.bibtex(file="references.bib")
+```
