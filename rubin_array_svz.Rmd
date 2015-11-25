@@ -1,0 +1,291 @@
+---
+title: "Follow-up Analysis using SVZ samples"
+output:
+  html_document:
+    theme: cerulean
+    toc: true
+    toc_depth: 4
+    fig_caption: true
+    fig_width: 8
+    fig_height: 6
+author: "Meeta Mistry"
+bibliography: references.bib
+---
+
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+clientname="Lida Katsimpardi" 
+clientemail=""
+labPI="Lee Rubin"
+lablocation=""
+analystname="Meeta Mistry"
+analystemail="mmistry@.hsph.harvard.edu"
+
+```
+
+---
+
+Array analysis for `r clientname`, `r labPI` group.  
+
+Contact `r analystname` (`r analystemail`) for additional details.
+
+The most recent update of this html document occurred: `r date()`
+
+> We decided to run these last samples to add information to our general hypothesis about what GDF11 does. In our previous published findings we showed that parabiosis and GDF11 increase neural stem cell numbers in the subventricular zone (SVZ). In very recent findings we see that GDF11 is present in the cerebrospinal fluid which is in direct contact with the SVZ and is known to have a regulatory role upon neural stem cells behavior. Also GDF11 appears to decline with aging in the CSF. 
+>
+> So the hypothesis is that maybe injected GDF11 acts on SVZ neural stem cells via the CSF to replenish the "lost with age" GDF11, thus having its beneficial effect- which add to the importance of checking the SVZ for transcriptional changes. 
+
+## Setup
+
+### Libraries
+
+```{r libraries_variables, echo=TRUE}
+
+loadlibs <- function(){
+library(knitr) # for simple tables
+library(oligo) # array utilities
+library(arrayQualityMetrics) # array quality control reports
+library(limma) # array statistical analyses
+library(pd.mogene.2.1.st) # array layout annotation
+library(mogene21sttranscriptcluster.db) #Annotation package for HTA 2.0
+library(ggplot2) # pretty graphs
+library(ggdendro) # for pretty dendrograms
+library(RColorBrewer) # more colors
+library(gridExtra) # for arranging multiple plots
+library(CHBUtils) # some homegrown functions
+library(sva) # Surrogate Variable Analysis (includes ComBat)
+library(pheatmap) # pretty heatmaps
+library(gProfileR) # Interface to g:Profiler
+}
+suppressPackageStartupMessages(loadlibs())
+```
+
+### Variables
+Working directories, files and other variables necessary to the analysis.
+
+```{r variables}
+## Setup Data and Results directory variables
+baseDir=getwd()
+dataDir <- file.path(baseDir, "data_svz")
+resultsDir <- file.path(baseDir, "results_svz")
+
+# Set color palettes for visualization tools  
+heatcolors.1 <- rev(brewer.pal(6, "YlOrRd"))
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7") # colorblind friendly palette
+covarsfilename="covars.desc" # comma delimited file describing samples
+lowintensity.percentile=0.1
+mad.quantile.cutoff=0.1
+pvalue.cutoff=0.05
+highlight.color="green"
+lfc.cutoff=1
+# Sys.setenv(R_THREADS=2)
+```
+
+
+## Import data and metadata
+We will first load the appropriate CEL files in together to create am ExpressionSet object.
+
+```{r old-data, results='hide', message=FALSE, warning=FALSE}
+
+covars <- read.table(file.path(dataDir, covarsfilename), sep="\t", header=TRUE, row.names=1)
+celFiles <- file.path("data_svz", row.names(covars))
+affyRaw <- read.celfiles(celFiles)
+pData(affyRaw) <- covars
+```
+
+## Quality Control
+
+Using the [arrayQualityMetrics](https://www.bioconductor.org/packages/3.3/bioc/html/arrayQualityMetrics.html) library we have generated a [report]((./results_svz/report_raw/index.html). From these diagnostic plots It seems as though there is an outlier sample (s88.ga.cel) based on array intensity distributions. We can remove this sample before normalizing. 
+
+```{r rawQC, eval=FALSE}
+arrayQualityMetrics(expressionset=affyRaw, outdir=file.path(resultsDir, 'report_raw'), force=TRUE, 
+                    do.logtransform=TRUE, intgroup=c("treat"))
+```
+
+
+## RMA normalize 
+
+Background correct and normalize the filtered data with RMA and re-run the QC analysis. The [report](./results_svz/report_rma/index.html) show that samples cluster even less by sample class. The [same pattern is observed](/results_svz/report_rma_all/index.html#S1) if we do not remove the outlier sample.
+
+```{r normalize-merged, results='hide'}
+affyRaw.filter <- affyRaw[,which(colnames(affyRaw) != "s88.ga.cel")]
+affyNorm <- rma(affyRaw.filter, target="core", background=TRUE, normalize=TRUE)
+```
+
+```{r rmaQC, eval=FALSE}
+arrayQualityMetrics(expressionset=affyNorm, outdir=file.path(resultsDir, 'report_rma_all'), force=TRUE, 
+                    do.logtransform=FALSE, intgroup=c("treat"))
+```
+
+
+### Quantro
+Since we are seeing the expected clustering of samples in the raw data disappearing on the normalized data -- it is possible that the global normalization method we apply is wiping out differences associated withe the biology. We can check this by using [quantro](https://www.bioconductor.org/packages/release/bioc/vignettes/quantro/inst/doc/quantro-vignette.pdf). 
+
+Normalization is achieved by forcing the observed distributions to be the same and the average distribution, obtained by taking the average of each quantile across samples, is used as the reference. Quantro will use the raw data to test for global differences between groups of distributions which asses whether global normalization methods such as quantile normalization should be applied. 
+
+```{r quantro}
+require(quantro)
+
+qtest <- quantro(object = log2(exprs(affyRaw)), groupFactor = covars$treat)
+qtest
+```
+
+Since we see that "`Average medians of the distributions are equal across groups` the null hypotheses is not rejected and therefore we cannot conclude that normalization is removing biological effect. It may just be that the effect is very small between teh saline and GDF11 treated samples.
+
+
+### PCA of samples
+Using the **500 most variable genes**, we plotted a PCA plot of the first two principal components where combined ~20% of the variance is explained. Even by looking at genes taht are changing the samples do not appear to segregate well.
+
+```{r pca, warning=FALSE, fig.align='center', echo=FALSE}
+
+# Perform PCA (requires transformed data matrix)
+ntop <- 500
+rv <- rowVars(exprs(affyNorm))
+select <- order(rv, decreasing=TRUE)[seq_len(ntop)]
+pca <- prcomp(t(exprs(affyNorm)[select,]))
+
+# Create data frame for input to ggplot
+df <- cbind(pData(affyNorm), pca$x[,c('PC1', 'PC2')])
+
+# Plot with sample names used as data points
+ggplot(df, aes(PC1, PC2, color = treat)) + 
+  theme_bw() +
+  geom_text(aes(label = row.names(df))) +
+#  geom_point(size=4) +
+  xlab('PC1 (12.69% variance explained)') +
+  ylab('PC2 (8.4% variance explained)') +
+  scale_x_continuous(expand = c(0.3,  0.3)) +
+  theme(plot.title = element_text(size = rel(1.5)),
+        axis.title = element_text(size = rel(1.5)),
+        axis.text = element_text(size = rel(1.25)))
+
+```
+
+## Annotate and Filter
+Here we load in metadata about the probesets on the array (feature data), the gene symbols in particular.
+
+```{r features-merged, results='hide'}
+
+featureData(affyNorm) <- getNetAffx(affyNorm, "transcript") # this will load the Affymetrix annotation
+fData(affyNorm)$symbol <- as.character(unlist(mget(featureNames(affyNorm), mogene21sttranscriptclusterSYMBOL, 
+                                                       ifnotfound=NA))) 
+fData(affyNorm)$entrezID <- as.character(unlist(mget(featureNames(affyNorm),
+                                          mogene21sttranscriptclusterENTREZID, ifnotfound=NA)))  
+```
+
+### Filter Probesets
+Reducing the number of genes assayed reduces  the multiple test correction and may allow us to identify more differentially expressed genes.
+
+**Filter By Annotation**
+- remove the control probes. We are keeping all other probes by request from the client.
+
+```{r filter1-merge}
+affyNorm <- affyNorm[ fData(affyNorm)$category=="main",]
+numprobes <- nrow(fData(affyNorm))
+```
+
+`r numprobes` probes remaining
+
+
+**Filter By Cross Hybridization**
+- some probes are annotated as potentially hybridizing to multiple targets
+
+```{r filter2-merge}
+affyNorm <- affyNorm[which(fData(affyNorm)$crosshybtype=="1"),]
+numprobes <- nrow(fData(affyNorm))
+```
+
+`r numprobes` probes remaining
+
+**Filter By Low Expression Level**
+- remove probes with low expression levels (bottom `r lowintensity.percentile*100`% of all expression levels) in all samples
+
+```{r filter3-merge, cache=TRUE}
+eset.all <- exprs(affyNorm)
+affyNorm <- affyNorm[!(apply(eset.all, 1, function(x) all(x<quantile(exprs(affyNorm), 
+                                                                         lowintensity.percentile)))),]
+numprobes <- nrow(fData(affyNorm))
+```
+
+`r numprobes` probes remaining
+
+**Filter By Low Variability**
+- remove probes with lower variation among all samples (without regard for group status) (dropped the bottom `r mad.quantile.cutoff*100`%) 
+
+```{r filter4-merge}
+eset.all <- exprs(affyNorm)
+rowmads <- apply(eset.all, 1, mad)
+mad.cutoff <- as.numeric(quantile(rowmads, mad.quantile.cutoff))
+affyNorm <- affyNorm[rowmads>mad.cutoff,]
+
+numprobes <- nrow(fData(affyNorm))
+```
+
+After all filtering stpes have been applied we are left with a total of `r numprobes` probes remaining.
+
+### PCA of filtered data
+Using the **500 most variable genes**, we can check to see if samples segregate better. Alhtough we do so a bit of separation with PC2 it os very subtle, and less variance explained by the first two principal components.
+
+```{r pca-postfilter, warning=FALSE, fig.align='center', echo=FALSE}
+
+# Perform PCA (requires transformed data matrix)
+ntop <- 500
+rv <- rowVars(exprs(affyNorm))
+select <- order(rv, decreasing=TRUE)[seq_len(ntop)]
+pca <- prcomp(t(exprs(affyNorm)[select,]))
+
+# Create data frame for input to ggplot
+df <- cbind(pData(affyNorm), pca$x[,c('PC1', 'PC2')])
+
+# Plot with sample names used as data points
+ggplot(df, aes(PC1, PC2, color = treat)) + 
+  theme_bw() +
+  geom_text(aes(label = row.names(df))) +
+#  geom_point(size=4) +
+  xlab('PC1 (5.9% variance explained)') +
+  ylab('PC2 (4.6% variance explained)') +
+  scale_x_continuous(expand = c(0.3,  0.3)) +
+  theme(plot.title = element_text(size = rel(1.5)),
+        axis.title = element_text(size = rel(1.5)),
+        axis.text = element_text(size = rel(1.25)))
+
+```
+
+## Limma: linear modeling
+A linear model for microarray data analysis (Limma) was performed on the samples to identify differentially expressed genes for comparisons of the sample groups. Limma fits a linear model to the expression data for all samples for each gene and is designed to handle complex experiments involving comparisons between many RNA targets simultaneously. **At an FDR of 0.1, there are no genes differentially expressed.** There are tiny fold changes for gene expression changes between Saline and GDF11 treated, and p-values are marginal.
+
+
+```{r limma-newdata}
+
+# Setup design matrix
+treat <- pData(affyNorm)$treat
+design <- model.matrix(~0 + treat)
+colnames(design) <- c("GDF11", "Saline")
+row.names(design) <- row.names(pData(affyNorm))
+
+# Fit model
+fit <- lmFit(exprs(affyNorm), design)
+contrasts <- makeContrasts(GDF11-Saline, levels=design)
+contr.fit <- eBayes(contrasts.fit(fit, contrasts))
+
+# Set threshold 
+results <- toptable(contr.fit, number=nrow(exprs(affyNorm)), coef=1, sort.by="P", adjust.method = "BH",
+                           genelist=fData(affyNorm)[,c("symbol", "entrezID")])
+
+```
+
+```{r volcano, echo=FALSE, fig.align='center'}
+
+ggplot(data=results, aes(x=logFC, y=-log10(P.Value))) +
+  #scale_color_manual(values = c("grey", "green")) +
+  geom_point(alpha=0.75, pch=16) +
+  theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5)),
+        axis.title = element_text(size = rel(1.5)),
+        axis.text = element_text(size = rel(1.25))) +
+  xlim(c(-2,2)) + ylim(c(0, 4)) +
+  xlab("log2 fold change") + ylab("-log10 p-value")
+```
+
+
+
