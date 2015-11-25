@@ -1,2 +1,2 @@
 # rubin-array
-mouse Gene ST arrays
+mouse Gene ST arrays analysis
